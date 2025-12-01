@@ -6,6 +6,7 @@
 import calendar
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 import numpy as np
 import pandas as pd
@@ -486,12 +487,19 @@ def navbar():
 def load_bl_data():
     """Load data specifically for the Black-Litterman page."""
     try:
-        px_prices = pd.read_parquet("data/raw/prices_cleaned.parquet")
+        # Use absolute paths relative to this file's location to work regardless of cwd
+        _app_dir = Path(__file__).parent.resolve()
+        _project_root = _app_dir.parent
+        
+        prices_path = _project_root / "data" / "raw" / "prices_cleaned.parquet"
+        sentiment_path = _project_root / "data" / "processed" / "sentiment_polarity.parquet"
+        
+        px_prices = pd.read_parquet(prices_path)
         px_prices = px_prices.sort_index().ffill().bfill()
         rets_all = np.log(px_prices / px_prices.shift(1))
 
         # Load sentiment_polarity.parquet and transform columns to match optimization code expectations
-        sentiment = pd.read_parquet("data/processed/sentiment_polarity.parquet")
+        sentiment = pd.read_parquet(sentiment_path)
         sentiment["date"] = pd.to_datetime(sentiment["date"]).dt.tz_localize(None)
         
         # Rename msg_count to n_msgs (expected by optimization code)
