@@ -550,52 +550,40 @@ def load_stock_list():
 
 @st.cache_data(show_spinner=False)
 def cached_compute_alpha(_sentiment_df, _rets_all, train_end_str):
-    """Cached alpha computation to avoid expensive regression on every page load."""
-    train_end = pd.Timestamp(train_end_str)
-    try:
-        return compute_alpha_dynamic(_sentiment_df, _rets_all, train_end)
-    except Exception:
-        return GLOBAL_BL_CONSTANTS['ALPHA']  # Fallback to default
+    """
+    Cached alpha computation.
+    Uses pre-calibrated default to avoid expensive regression on cloud.
+    The default value (0.00114) was calibrated from historical data (2009-2015).
+    """
+    # Skip expensive regression - use pre-calibrated alpha
+    # This avoids memory crashes on Streamlit Cloud
+    return GLOBAL_BL_CONSTANTS['ALPHA']
 
 
 @st.cache_data(show_spinner=False)
 def cached_training_universe(_px_prices, _rets_all, _sentiment_df, train_start_str, train_end_str, lam):
     """
-    Cached computation of training universe.
-    Uses quarterly rebalancing to reduce computation time.
+    Returns a static S&P 500 universe filtered by available price data.
+    Avoids expensive iterative computation that crashes on cloud.
     """
-    train_start = pd.Timestamp(train_start_str)
-    train_end = pd.Timestamp(train_end_str)
+    # Use static S&P 500 universe (2019 constituents)
+    SP500_TICKERS = [
+        "AAPL", "MSFT", "AMZN", "GOOGL", "FB", "JPM", "JNJ", "V", "PG", "UNH",
+        "HD", "MA", "NVDA", "DIS", "PYPL", "VZ", "ADBE", "NFLX", "INTC", "T",
+        "MRK", "PFE", "KO", "PEP", "WMT", "ABT", "CSCO", "XOM", "CVX", "BA",
+        "MCD", "WFC", "MDT", "COST", "NEE", "TMO", "ACN", "DHR", "LLY", "AMGN",
+        "IBM", "TXN", "HON", "UNP", "PM", "LIN", "ORCL", "AMT", "LOW", "SBUX",
+        "MMM", "GE", "CAT", "GS", "BLK", "GILD", "AXP", "BKNG", "ISRG", "MDLZ",
+        "CME", "TJX", "CHTR", "MO", "DUK", "SYK", "CI", "BDX", "ANTM", "ZTS",
+        "CL", "USB", "SO", "PNC", "CB", "MS", "SPGI", "D", "CCI", "TGT",
+        "EQIX", "ICE", "NSC", "APD", "FIS", "ITW", "MMC", "BSX", "ATVI", "SHW",
+        "PLD", "CSX", "ECL", "NOC", "VRTX", "GD", "ADP", "COP", "AON", "HUM"
+    ]
     
-    # Use QUARTERLY instead of monthly for cloud performance
-    rebal_train = pd.date_range(train_start, train_end, freq="QE")
+    # Filter to only tickers available in price data
+    available_tickers = [t for t in SP500_TICKERS if t in _px_prices.columns]
     
-    alpha_dyn = GLOBAL_BL_CONSTANTS['ALPHA']  # Use default for training
-    Z_THRESHOLD_TRAIN = 0.5
-    
-    weights_train = {}
-    last_w_train = None
-    
-    for t in rebal_train:
-        try:
-            w_t, K_detected, strong_views = black_litterman_weights_for_date(
-                t=t, sentiment_df=_sentiment_df, lam=lam, px_prices=_px_prices,
-                rets_all=_rets_all, alpha_dyn=alpha_dyn, z_threshold=Z_THRESHOLD_TRAIN, fixed_universe=None,
-            )
-            if w_t is not None:
-                weights_train[t] = w_t.copy()
-                last_w_train = w_t.copy()
-            else:
-                weights_train[t] = last_w_train.copy() if last_w_train is not None else None
-        except Exception:
-            weights_train[t] = last_w_train.copy() if last_w_train is not None else None
-    
-    train_universe = set()
-    for w in weights_train.values():
-        if w is not None:
-            train_universe |= set(w["ticker"].tolist())
-    
-    return sorted(train_universe)
+    return available_tickers
 
 
 # ==========================================
