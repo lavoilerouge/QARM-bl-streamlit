@@ -548,6 +548,56 @@ def load_stock_list():
     return None
 
 
+@st.cache_data(show_spinner=False)
+def cached_compute_alpha(_sentiment_df, _rets_all, train_end_str):
+    """Cached alpha computation to avoid expensive regression on every page load."""
+    train_end = pd.Timestamp(train_end_str)
+    try:
+        return compute_alpha_dynamic(_sentiment_df, _rets_all, train_end)
+    except Exception:
+        return GLOBAL_BL_CONSTANTS['ALPHA']  # Fallback to default
+
+
+@st.cache_data(show_spinner=False)
+def cached_training_universe(_px_prices, _rets_all, _sentiment_df, train_start_str, train_end_str, lam):
+    """
+    Cached computation of training universe.
+    Uses quarterly rebalancing to reduce computation time.
+    """
+    train_start = pd.Timestamp(train_start_str)
+    train_end = pd.Timestamp(train_end_str)
+    
+    # Use QUARTERLY instead of monthly for cloud performance
+    rebal_train = pd.date_range(train_start, train_end, freq="QE")
+    
+    alpha_dyn = GLOBAL_BL_CONSTANTS['ALPHA']  # Use default for training
+    Z_THRESHOLD_TRAIN = 0.5
+    
+    weights_train = {}
+    last_w_train = None
+    
+    for t in rebal_train:
+        try:
+            w_t, K_detected, strong_views = black_litterman_weights_for_date(
+                t=t, sentiment_df=_sentiment_df, lam=lam, px_prices=_px_prices,
+                rets_all=_rets_all, alpha_dyn=alpha_dyn, z_threshold=Z_THRESHOLD_TRAIN, fixed_universe=None,
+            )
+            if w_t is not None:
+                weights_train[t] = w_t.copy()
+                last_w_train = w_t.copy()
+            else:
+                weights_train[t] = last_w_train.copy() if last_w_train is not None else None
+        except Exception:
+            weights_train[t] = last_w_train.copy() if last_w_train is not None else None
+    
+    train_universe = set()
+    for w in weights_train.values():
+        if w is not None:
+            train_universe |= set(w["ticker"].tolist())
+    
+    return sorted(train_universe)
+
+
 # ==========================================
 # 4. CORE MATH & UTILITY FUNCTIONS
 # ==========================================
@@ -1117,35 +1167,23 @@ def blacklitterman_page():
     date_selected_dt = pd.to_datetime(date_selected)
     train_end = date_selected_dt - pd.Timedelta(days=1)
     train_start = pd.Timestamp("2009-07-10")
-    rebal_train = pd.date_range(train_start, train_end, freq="BME")
-    Z_THRESHOLD_TRAIN = 0.5
-    alpha_dyn = compute_alpha_dynamic(
-    sentiment_df,
-    rets_all,
-    train_end)
+    
+    # Use CACHED alpha computation (avoids expensive regression on every load)
+    with st.spinner("Computing alpha sensitivity (cached)..."):
+        alpha_dyn = cached_compute_alpha(
+            sentiment_df, rets_all, str(train_end)
+        )
 
     st.markdown(
         f"<h3 style='text-align: center; color: #888; font-weight: 300; margin-bottom: 40px;'>Analysis Date: <span style='color: #fff'>{date_selected_dt.strftime('%B %d, %Y')}</span></h3>",
         unsafe_allow_html=True)
 
-    # Background Universe Calculation
-    weights_train, last_w_train = {}, None
-    with st.spinner("Scanning Investment Universe..."):
-        for t in rebal_train:
-            w_t, K_detected, strong_views = black_litterman_weights_for_date(
-                t=t, sentiment_df=sentiment_df, lam=lam, px_prices=px_prices,
-                rets_all=rets_all, alpha_dyn=alpha_dyn, z_threshold=Z_THRESHOLD_TRAIN, fixed_universe=None,
-            )
-            if w_t is not None:
-                weights_train[t] = w_t.copy()
-                last_w_train = w_t.copy()
-            else:
-                weights_train[t] = last_w_train.copy() if last_w_train is not None else None
-
-    train_universe = set()
-    for w in weights_train.values():
-        if w is not None: train_universe |= set(w["ticker"].tolist())
-    train_universe = sorted(train_universe)
+    # Use CACHED training universe (avoids expensive loop on every load)
+    with st.spinner("Loading Investment Universe (cached)..."):
+        train_universe = cached_training_universe(
+            px_prices, rets_all, sentiment_df,
+            str(train_start), str(train_end), lam
+        )
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Tradeable Universe", f"{len(train_universe)} Assets")
