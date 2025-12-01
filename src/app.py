@@ -535,6 +535,116 @@ def load_stock_list():
     return None
 
 
+@st.cache_data(show_spinner=False)
+def compute_training_universe(_px_prices, _rets_all, _sentiment_df, train_start, train_end, lam, z_threshold_train):
+    """
+    Cached computation of training universe.
+    Uses monthly rebalancing (BME = Business Month End).
+    """
+    # Monthly rebalancing for training
+    rebal_train = pd.date_range(train_start, train_end, freq="BME")
+    
+    weights_train = {}
+    last_w_train = None
+    
+    for t in rebal_train:
+        w_t, K_detected, strong_views = black_litterman_weights_for_date(
+            t=t, sentiment_df=_sentiment_df, lam=lam, px_prices=_px_prices,
+            rets_all=_rets_all, alpha_dyn=0.00114,  # Use default alpha for training
+            z_threshold=z_threshold_train, fixed_universe=None,
+        )
+        if w_t is not None:
+            weights_train[t] = w_t.copy()
+            last_w_train = w_t.copy()
+        else:
+            weights_train[t] = last_w_train.copy() if last_w_train is not None else None
+    
+    train_universe = set()
+    for w in weights_train.values():
+        if w is not None:
+            train_universe |= set(w["ticker"].tolist())
+    
+    return sorted(train_universe)
+
+
+def compute_oos_with_progress(rebal_dates, px_prices, sentiment_df, lam, rets_all, alpha_dyn, z_threshold,
+                               train_universe, max_long, leverage_limit, progress_bar, status_text):
+    """
+    Compute OOS backtest with progress bar updates.
+    Optimized version with batch processing.
+    """
+    price_index = px_prices.index
+    last_w = None
+    weights_oos = {}
+    total_dates = len(rebal_dates)
+    
+    # Phase 1: Calculate weights (60% of progress)
+    for i, t in enumerate(rebal_dates):
+        progress = int((i / total_dates) * 60)
+        progress_bar.progress(progress, text=f"Calculating weights... {progress}%")
+        status_text.text(f"Processing date {i+1}/{total_dates}: {t.strftime('%Y-%m-%d')}")
+        
+        w_t, K_detected, strong_views = black_litterman_weights_for_date(
+            t=t, sentiment_df=sentiment_df, lam=lam, px_prices=px_prices,
+            rets_all=rets_all, window_sent=30, lookback_days=180, top_n=50,
+            max_long=max_long, max_short=GLOBAL_BL_CONSTANTS['MAX_SHORT'], leverage_limit=leverage_limit,
+            alpha_dyn=alpha_dyn, z_threshold=z_threshold, fixed_universe=train_universe,
+        )
+        if (w_t is None) or (len(w_t) == 0):
+            weights_oos[t] = last_w.copy() if last_w is not None else None
+        else:
+            weights_oos[t] = w_t.copy()
+            last_w = w_t.copy()
+    
+    # Phase 2: Calculate returns (40% of progress)
+    returns_oos = []
+    weight_items = list(weights_oos.items())
+    
+    for i, (t, w_df) in enumerate(weight_items):
+        progress = 60 + int((i / len(weight_items)) * 40)
+        progress_bar.progress(progress, text=f"Computing returns... {progress}%")
+        
+        t = pd.Timestamp(t)
+        start, end = next_month_window(t, price_index)
+        if start is None or end is None:
+            continue
+        if w_df is None:
+            dates = price_index[(price_index >= start) & (price_index <= end)]
+            returns_oos.append(pd.DataFrame({"date": dates, "ret": 0.0}))
+            continue
+
+        tickers = w_df["ticker"].tolist()
+        available_cols = [tic for tic in tickers if tic in px_prices.columns]
+        if not available_cols:
+            continue
+
+        px_win = get_window_prices(px_prices, available_cols, start, end)
+        rets_win = np.log(px_win / px_win.shift(1)).dropna()
+
+        common = [tic for tic in tickers if tic in rets_win.columns]
+        if len(common) < 2:
+            continue
+
+        R = rets_win[common].values
+        w_df_indexed = w_df.set_index("ticker")
+        w_sub = w_df_indexed.loc[common]["w_opt"]
+        w_sub_sum = w_sub.sum()
+        w_vec = (w_sub / w_sub_sum).values if w_sub_sum != 0 else np.zeros(len(common))
+
+        port_rets = R @ w_vec
+        returns_oos.append(pd.DataFrame({"date": rets_win.index, "ret": port_rets}))
+
+    progress_bar.progress(100, text="Complete! 100%")
+    
+    if len(returns_oos) == 0:
+        return None
+
+    nav = pd.concat(returns_oos).groupby("date")["ret"].sum()
+    nav = np.exp(nav.cumsum())
+    nav /= nav.iloc[0]
+    return nav
+
+
 # ==========================================
 # 4. CORE MATH & UTILITY FUNCTIONS
 # ==========================================
@@ -1104,35 +1214,21 @@ def blacklitterman_page():
     date_selected_dt = pd.to_datetime(date_selected)
     train_end = date_selected_dt - pd.Timedelta(days=1)
     train_start = pd.Timestamp("2009-07-10")
-    rebal_train = pd.date_range(train_start, train_end, freq="BME")
     Z_THRESHOLD_TRAIN = 0.5
-    alpha_dyn = compute_alpha_dynamic(
-    sentiment_df,
-    rets_all,
-    train_end)
+    
+    # Compute alpha dynamically
+    alpha_dyn = compute_alpha_dynamic(sentiment_df, rets_all, train_end)
 
     st.markdown(
         f"<h3 style='text-align: center; color: #888; font-weight: 300; margin-bottom: 40px;'>Analysis Date: <span style='color: #fff'>{date_selected_dt.strftime('%B %d, %Y')}</span></h3>",
         unsafe_allow_html=True)
 
-    # Background Universe Calculation
-    weights_train, last_w_train = {}, None
-    with st.spinner("Scanning Investment Universe..."):
-        for t in rebal_train:
-            w_t, K_detected, strong_views = black_litterman_weights_for_date(
-                t=t, sentiment_df=sentiment_df, lam=lam, px_prices=px_prices,
-                rets_all=rets_all, alpha_dyn=alpha_dyn, z_threshold=Z_THRESHOLD_TRAIN, fixed_universe=None,
-            )
-            if w_t is not None:
-                weights_train[t] = w_t.copy()
-                last_w_train = w_t.copy()
-            else:
-                weights_train[t] = last_w_train.copy() if last_w_train is not None else None
-
-    train_universe = set()
-    for w in weights_train.values():
-        if w is not None: train_universe |= set(w["ticker"].tolist())
-    train_universe = sorted(train_universe)
+    # Use cached training universe computation (much faster)
+    with st.spinner("Loading Investment Universe (cached)..."):
+        train_universe = compute_training_universe(
+            px_prices, rets_all, sentiment_df,
+            train_start, train_end, lam, Z_THRESHOLD_TRAIN
+        )
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Tradeable Universe", f"{len(train_universe)} Assets")
@@ -1239,12 +1335,21 @@ def blacklitterman_page():
                 if not future_dates.empty:
                     rebal_dates = future_dates.to_series().groupby(
                         [future_dates.year, future_dates.month]).last().to_list()
-                    with st.spinner("Calculating OOS Equity Curve..."):
-                        nav_oos_custom = compute_oos_rebalanced_notebook_style(
-                            rebal_dates=rebal_dates, px_prices=px_prices, sentiment_df=sentiment_df,
-                            lam=lam, rets_all=rets_all, alpha_dyn=alpha_dyn, z_threshold=z_threshold,
-                            train_universe=train_universe, max_long=max_long, leverage_limit=leverage
-                        )
+                    
+                    # Progress bar for OOS computation
+                    st.markdown("#### Computing Walk-Forward Backtest")
+                    progress_bar = st.progress(0, text="Initializing... 0%")
+                    status_text = st.empty()
+                    
+                    nav_oos_custom = compute_oos_with_progress(
+                        rebal_dates=rebal_dates, px_prices=px_prices, sentiment_df=sentiment_df,
+                        lam=lam, rets_all=rets_all, alpha_dyn=alpha_dyn, z_threshold=z_threshold,
+                        train_universe=train_universe, max_long=max_long, leverage_limit=leverage,
+                        progress_bar=progress_bar, status_text=status_text
+                    )
+                    
+                    # Clear progress indicators
+                    status_text.empty()
 
                     if nav_oos_custom is not None and len(nav_oos_custom) > 0:
                         sp500_data = yf.download("^GSPC", start=date_selected_dt, end="2020-03-31",
