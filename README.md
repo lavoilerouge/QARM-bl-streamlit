@@ -14,24 +14,27 @@ QARM/
 ├── config.py                 # ⚙️ Configuration (paths, parameters)
 ├── requirements.txt          # 📦 Python dependencies
 ├── README.md                 # 📖 This file
+├── .gitignore
+│
+├── .streamlit/               # Streamlit configuration
+│   └── config.toml
 │
 ├── src/                      # Source code
 │   ├── __init__.py
 │   ├── app.py               # Streamlit application
-│   ├── optimization.py      # Black-Litterman & optimization logic
+│   ├── config.py            # Config re-exports
 │   ├── download_all_stocks.py  # NYSE/NASDAQ stock list downloader
-│   └── config.py            # Config re-exports
+│   └── optimization.py      # Black-Litterman & optimization logic
 │
 ├── data/                     # Data directory
 │   ├── raw/                  # Raw input data
-│   │   ├── stocktwits_optimized.parquet  # StockTwits sentiment data
 │   │   └── prices_cleaned.parquet        # Historical stock prices
 │   │
 │   └── processed/            # Generated data files
-│       ├── sentiment_polarity.parquet    # Aggregated daily sentiment polarity
-│       ├── SP500_data.parquet            # S&P 500 benchmark data
+│       ├── all_nyse_nasdaq_stocks_etfs.csv  # Stock/ETF list
 │       ├── RF_10.parquet                 # Risk-free rate data
-│       └── all_nyse_nasdaq_stocks_etfs.csv  # Stock/ETF list
+│       ├── sentiment_polarity.parquet    # Aggregated daily sentiment polarity
+│       └── SP500_data.parquet            # S&P 500 benchmark data
 ```
 
 ---
