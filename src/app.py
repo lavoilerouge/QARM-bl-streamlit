@@ -498,28 +498,46 @@ def load_bl_data():
         px_prices = px_prices.sort_index().ffill().bfill()
         rets_all = np.log(px_prices / px_prices.shift(1))
 
-        # Load sentiment_polarity.parquet and transform columns to match optimization code expectations
+        # Load sentiment_polarity.parquet - it should already contain sentiment_z
         sentiment = pd.read_parquet(sentiment_path)
         sentiment["date"] = pd.to_datetime(sentiment["date"]).dt.tz_localize(None)
         
-        # Rename msg_count to n_msgs (expected by optimization code)
-        sentiment = sentiment.rename(columns={"msg_count": "n_msgs"})
+        # Rename msg_count to n_msgs if needed (expected by optimization code)
+        if "msg_count" in sentiment.columns and "n_msgs" not in sentiment.columns:
+            sentiment = sentiment.rename(columns={"msg_count": "n_msgs"})
         
-        # Compute sentiment_z (z-score of polarity) using rolling statistics
-        sentiment = sentiment.sort_values(["ticker", "date"])
-        sentiment["polarity_mean"] = sentiment.groupby("ticker")["polarity"].transform(
-            lambda x: x.rolling(60, min_periods=20).mean()
-        )
-        sentiment["polarity_std"] = sentiment.groupby("ticker")["polarity"].transform(
-            lambda x: x.rolling(60, min_periods=20).std()
-        )
-        sentiment["sentiment_z"] = (
-            sentiment["polarity"] - sentiment["polarity_mean"]
-        ) / sentiment["polarity_std"]
+        # Only compute sentiment_z if not already present in the parquet file
+        # This avoids the expensive rolling groupby operation
+        if "sentiment_z" not in sentiment.columns:
+            st.warning("Computing sentiment_z (this may take a while on first run)...")
+            sentiment = sentiment.sort_values(["ticker", "date"])
+            
+            # Use a more efficient approach with numpy for rolling calculations
+            def compute_rolling_zscore(group):
+                polarity = group["polarity"].values
+                n = len(polarity)
+                z_scores = np.full(n, np.nan)
+                
+                for i in range(20, n):  # min_periods=20
+                    window_start = max(0, i - 60)
+                    window = polarity[window_start:i]
+                    if len(window) >= 20:
+                        mean = np.nanmean(window)
+                        std = np.nanstd(window)
+                        if std > 0:
+                            z_scores[i] = (polarity[i] - mean) / std
+                
+                group["sentiment_z"] = z_scores
+                return group
+            
+            sentiment = sentiment.groupby("ticker", group_keys=False).apply(compute_rolling_zscore)
 
         return px_prices, rets_all.dropna(), sentiment
     except FileNotFoundError as e:
-        st.error(f"FATAL ERROR: Missing data files for Black-Litterman in the current directory.")
+        st.error(f"FATAL ERROR: Missing data files for Black-Litterman. Error: {e}")
+        st.stop()
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
         st.stop()
 
 
