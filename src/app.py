@@ -494,32 +494,45 @@ def load_bl_data():
         prices_path = _project_root / "data" / "raw" / "prices_cleaned.parquet"
         sentiment_path = _project_root / "data" / "processed" / "sentiment_polarity.parquet"
         
+        # Load prices with memory optimization
         px_prices = pd.read_parquet(prices_path)
         px_prices = px_prices.sort_index().ffill().bfill()
+        
+        # Compute returns
         rets_all = np.log(px_prices / px_prices.shift(1))
 
-        # Load sentiment_polarity.parquet and transform columns to match optimization code expectations
+        # Load sentiment - only required columns to save memory
+        # The parquet file should already have sentiment_z pre-computed
         sentiment = pd.read_parquet(sentiment_path)
         sentiment["date"] = pd.to_datetime(sentiment["date"]).dt.tz_localize(None)
         
-        # Rename msg_count to n_msgs (expected by optimization code)
-        sentiment = sentiment.rename(columns={"msg_count": "n_msgs"})
+        # Rename msg_count to n_msgs if needed (expected by optimization code)
+        if "msg_count" in sentiment.columns and "n_msgs" not in sentiment.columns:
+            sentiment = sentiment.rename(columns={"msg_count": "n_msgs"})
         
-        # Compute sentiment_z (z-score of polarity) using rolling statistics
-        sentiment = sentiment.sort_values(["ticker", "date"])
-        sentiment["polarity_mean"] = sentiment.groupby("ticker")["polarity"].transform(
-            lambda x: x.rolling(60, min_periods=20).mean()
-        )
-        sentiment["polarity_std"] = sentiment.groupby("ticker")["polarity"].transform(
-            lambda x: x.rolling(60, min_periods=20).std()
-        )
-        sentiment["sentiment_z"] = (
-            sentiment["polarity"] - sentiment["polarity_mean"]
-        ) / sentiment["polarity_std"]
+        # Check if sentiment_z already exists (it should from the parquet)
+        # If not, compute it - but this is EXPENSIVE and may crash on cloud
+        if "sentiment_z" not in sentiment.columns:
+            st.warning("⚠️ Computing sentiment_z - this may be slow...")
+            sentiment = sentiment.sort_values(["ticker", "date"])
+            sentiment["polarity_mean"] = sentiment.groupby("ticker")["polarity"].transform(
+                lambda x: x.rolling(60, min_periods=20).mean()
+            )
+            sentiment["polarity_std"] = sentiment.groupby("ticker")["polarity"].transform(
+                lambda x: x.rolling(60, min_periods=20).std()
+            )
+            sentiment["sentiment_z"] = (
+                sentiment["polarity"] - sentiment["polarity_mean"]
+            ) / sentiment["polarity_std"]
+            # Drop intermediate columns to save memory
+            sentiment = sentiment.drop(columns=["polarity_mean", "polarity_std"], errors="ignore")
 
         return px_prices, rets_all.dropna(), sentiment
     except FileNotFoundError as e:
-        st.error(f"FATAL ERROR: Missing data files for Black-Litterman in the current directory.")
+        st.error(f"FATAL ERROR: Missing data files for Black-Litterman. Check data/raw/ and data/processed/ folders.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
         st.stop()
 
 
