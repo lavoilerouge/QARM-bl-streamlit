@@ -23,8 +23,6 @@ from pandas_datareader import data as pdr
 from sklearn.covariance import LedoitWolf
 import cvxpy as cp
 from numpy.linalg import solve
-import sys
-import os
 
 # =============================================================================
 # CONFIGURATION & PATHS
