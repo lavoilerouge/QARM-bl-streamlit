@@ -60,7 +60,7 @@ def init_session_state():
     if "accredited_answer" not in st.session_state:
         st.session_state.accredited_answer = None
     if 'selected_tickers' not in st.session_state:
-        st.session_state.selected_tickers = ['ASTS', 'RKLB', 'MSFT', 'GOOGL', 'TSLA']
+        st.session_state.selected_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
 
 
 def apply_custom_styles():
