@@ -723,10 +723,59 @@ def plot_correlation_heatmap(returns_df):
 
 # --- Optimizer Utilities ---
 
+def get_historical_shares_outstanding(stock, current_shares, rebalance_date):
+    """
+    Calculate historical shares outstanding by reverse-adjusting for splits.
+    
+    Args:
+        stock: yfinance Ticker object
+        current_shares: Current shares outstanding
+        rebalance_date: The historical date for which we want shares outstanding
+    
+    Returns:
+        Adjusted shares outstanding for the historical date
+    """
+    if current_shares is None or rebalance_date is None:
+        return current_shares
+    
+    try:
+        # Get all splits
+        splits = stock.splits
+        if splits is None or splits.empty:
+            return current_shares
+        
+        # Ensure rebalance_date is timezone-naive for comparison
+        rebalance_date = pd.to_datetime(rebalance_date)
+        if rebalance_date.tzinfo is not None:
+            rebalance_date = rebalance_date.tz_localize(None)
+        
+        # Filter splits that occurred AFTER the rebalance date (these need to be reversed)
+        splits_after = splits.copy()
+        splits_after.index = splits_after.index.tz_localize(None) if splits_after.index.tzinfo is not None else splits_after.index
+        splits_after = splits_after[splits_after.index > rebalance_date]
+        
+        if splits_after.empty:
+            return current_shares
+        
+        # Calculate the cumulative split factor to reverse
+        # A split of 4.0 means 4-for-1 (shares multiplied by 4)
+        # To get historical shares, we divide current shares by all splits that happened after
+        cumulative_split_factor = splits_after.prod()
+        
+        historical_shares = current_shares / cumulative_split_factor
+        return historical_shares
+        
+    except Exception:
+        return current_shares
+
+
 def get_market_caps(tickers, rebalance_date=None, data_source=None):
     """
     Fetch market capitalizations for given tickers at a specific date.
-    Market cap = shares outstanding × price at rebalance_date
+    Market cap = historical shares outstanding × price at rebalance_date
+    
+    Historical shares outstanding is calculated by reverse-adjusting current
+    shares for any splits that occurred between rebalance_date and today.
     """
     market_caps = {}
     
@@ -738,16 +787,35 @@ def get_market_caps(tickers, rebalance_date=None, data_source=None):
             stock = yf.Ticker(ticker)
             info = stock.info
             
-            # Get shares outstanding
-            shares_out = info.get('sharesOutstanding', None)
-            if shares_out is None:
+            # Get current shares outstanding
+            current_shares = info.get('sharesOutstanding', None)
+            if current_shares is None:
+                # Try fast_info as fallback
+                current_shares = getattr(stock.fast_info, 'shares_outstanding', None)
+            if current_shares is None:
                 continue
             
-            # Get price at rebalance_date
+            # Calculate historical shares outstanding (adjusted for splits)
+            historical_shares = get_historical_shares_outstanding(stock, current_shares, rebalance_date)
+            
+            # Get price at rebalance_date (using NON-adjusted price for accurate market cap)
             price = None
             
-            # Try data_source first
-            if data_source is not None and rebalance_date is not None and ticker in data_source.columns:
+            # Fetch historical price from Yahoo Finance (unadjusted)
+            if rebalance_date is not None:
+                start = rebalance_date - pd.Timedelta(days=7)
+                end = rebalance_date + pd.Timedelta(days=1)
+                # Use auto_adjust=False to get unadjusted prices
+                hist = stock.history(start=start, end=end, auto_adjust=False)
+                if not hist.empty:
+                    # Get closest date on or before rebalance_date
+                    hist.index = hist.index.tz_localize(None) if hist.index.tzinfo is not None else hist.index
+                    valid_dates = hist.index[hist.index <= rebalance_date]
+                    if len(valid_dates) > 0:
+                        price = hist.loc[valid_dates[-1], 'Close']
+            
+            # Fallback: try data_source (note: this might be adjusted prices)
+            if price is None and data_source is not None and rebalance_date is not None and ticker in data_source.columns:
                 available_dates = data_source.index[data_source.index <= rebalance_date]
                 if len(available_dates) > 0:
                     closest_date = available_dates[-1]
@@ -755,25 +823,13 @@ def get_market_caps(tickers, rebalance_date=None, data_source=None):
                     if pd.isna(price):
                         price = None
             
-            # Fallback: fetch historical price from Yahoo Finance
-            if price is None and rebalance_date is not None:
-                start = rebalance_date - pd.Timedelta(days=7)
-                end = rebalance_date + pd.Timedelta(days=1)
-                hist = stock.history(start=start, end=end)
-                if not hist.empty:
-                    # Get closest date on or before rebalance_date
-                    hist.index = hist.index.tz_localize(None)
-                    valid_dates = hist.index[hist.index <= rebalance_date]
-                    if len(valid_dates) > 0:
-                        price = hist.loc[valid_dates[-1], 'Close']
-            
-            # Final fallback: current price
-            if price is None:
+            # Final fallback: current price (only if no rebalance_date specified)
+            if price is None and rebalance_date is None:
                 price = info.get('regularMarketPrice') or info.get('previousClose')
             
-            # Compute market cap
-            if price is not None and not pd.isna(price):
-                market_cap = float(shares_out) * float(price)
+            # Compute market cap using historical shares and historical price
+            if price is not None and not pd.isna(price) and historical_shares is not None:
+                market_cap = float(historical_shares) * float(price)
                 if market_cap > 0:
                     market_caps[ticker] = market_cap
                     
