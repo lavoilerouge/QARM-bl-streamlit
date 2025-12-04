@@ -121,75 +121,72 @@ SP500_TICKERS_2019 = [
 # DATA LOADING FUNCTIONS
 # =============================================================================
 # =======================================
-# MARKET CAP CACHING (FAST)
+# MARKET CAP CALCULATION (CONSISTENT WITH VALUE-WEIGHTED)
 # =======================================
 
-# =======================================
-# MARKET CAP CACHING (FAST)
-# =======================================
-
-MARKET_CAP_CACHE_FILE = Path("data/processed/market_caps.parquet")
-
-def load_market_cap_cache():
-    """Load cached market caps if available."""
-    if MARKET_CAP_CACHE_FILE.exists():
+def get_market_caps_for_date(tickers, rebalance_date, px_prices=None):
+    """
+    Fetch market capitalizations for given tickers at a specific date.
+    Market cap = shares outstanding × price at rebalance_date
+    
+    This function is consistent with the value-weighted optimization in app.py.
+    """
+    market_caps = {}
+    
+    if rebalance_date is not None:
+        rebalance_date = pd.to_datetime(rebalance_date)
+    
+    for ticker in tickers:
         try:
-            return pd.read_parquet(MARKET_CAP_CACHE_FILE).set_index("ticker")["market_cap"].to_dict()
-        except:
-            return {}
-    return {}
-
-def save_market_cap_cache(cache_dict):
-    """Save new market caps to disk."""
-    df = pd.DataFrame([
-        {"ticker": tic, "market_cap": mc} for tic, mc in cache_dict.items()
-    ])
-    df.to_parquet(MARKET_CAP_CACHE_FILE, index=False)
-
-def robust_market_caps_cached(tickers, px_last):
-    """
-    Returns market caps quickly using:
-    - local cache when possible
-    - Yahoo only for missing tickers
-    - Automatic update of the cache
-    """
-    cache = load_market_cap_cache()
-    new_data = {}
-
-    # What needs to be downloaded?
-    missing = [t for t in tickers if t not in cache]
-
-    # Yahoo calls only for missing tickers
-    if missing:
-        for t in missing:
-            try:
-                yf_t = yf.Ticker(t)
-
-                # market_cap
-                mc = yf_t.fast_info.get("market_cap", None)
-
-                # fallback
-                if mc is None or not np.isfinite(mc):
-                    shares = yf_t.fast_info.get("shares_outstanding", None)
-                    if shares is None:
-                        shares = yf_t.info.get("sharesOutstanding", None)
-
-                    if shares is not None:
-                        price = px_last.get(t, None)
-                        if price is not None:
-                            mc = shares * price
-
-                if mc is not None and np.isfinite(mc):
-                    new_data[t] = float(mc)
-
-            except:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            
+            # Get shares outstanding
+            shares_out = info.get('sharesOutstanding', None)
+            if shares_out is None:
+                # Try fast_info as fallback
+                shares_out = getattr(stock.fast_info, 'shares_outstanding', None)
+            if shares_out is None:
                 continue
-
-        # Update local cache on disk
-        cache.update(new_data)
-        save_market_cap_cache(cache)
-
-    return cache
+            
+            # Get price at rebalance_date
+            price = None
+            
+            # Try px_prices (price data) first
+            if px_prices is not None and rebalance_date is not None and ticker in px_prices.columns:
+                available_dates = px_prices.index[px_prices.index <= rebalance_date]
+                if len(available_dates) > 0:
+                    closest_date = available_dates[-1]
+                    price = px_prices.loc[closest_date, ticker]
+                    if pd.isna(price):
+                        price = None
+            
+            # Fallback: fetch historical price from Yahoo Finance
+            if price is None and rebalance_date is not None:
+                start = rebalance_date - pd.Timedelta(days=7)
+                end = rebalance_date + pd.Timedelta(days=1)
+                hist = stock.history(start=start, end=end)
+                if not hist.empty:
+                    # Get closest date on or before rebalance_date
+                    hist.index = hist.index.tz_localize(None)
+                    valid_dates = hist.index[hist.index <= rebalance_date]
+                    if len(valid_dates) > 0:
+                        price = hist.loc[valid_dates[-1], 'Close']
+            
+            # Final fallback: current price
+            if price is None:
+                price = info.get('regularMarketPrice') or info.get('previousClose')
+            
+            # Compute market cap
+            if price is not None and not pd.isna(price):
+                market_cap = float(shares_out) * float(price)
+                if market_cap > 0:
+                    market_caps[ticker] = market_cap
+                    
+        except Exception:
+            continue
+    
+    return market_caps
 
 def load_stocktwits_info():
     """Load and display StockTwits dataset information."""
@@ -580,12 +577,10 @@ def black_litterman_weights_for_date(
     gamma = float(lam)
     vols = np.sqrt(np.diag(Sigma_mens))
 
-    px_last = px_prices.loc[t, universe].to_dict()
+    # Get market caps at rebalance date (consistent with value-weighted optimization)
+    caps_dict = get_market_caps_for_date(tickers, rebalance_date=t, px_prices=px_prices)
 
-    # Load from cache (fast) + update missing tickers (slow)
-    caps_dict = robust_market_caps_cached(tickers, px_last)
-
-    caps = np.array([caps_dict.get(t, np.nan) for t in tickers])
+    caps = np.array([caps_dict.get(ticker, np.nan) for ticker in tickers])
     valid = ~np.isnan(caps)
 
     if valid.sum() < 2:
