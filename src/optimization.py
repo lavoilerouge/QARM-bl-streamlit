@@ -573,21 +573,29 @@ def black_litterman_weights_for_date(
     Sigma_mens = Sigma_daily * 21
     Sigma_mens += 1e-8 * np.eye(N)
 
-    # Market portfolio (inverse volatility)
+    # Market portfolio weights
     gamma = float(lam)
     vols = np.sqrt(np.diag(Sigma_mens))
 
-    # Get market caps at rebalance date (consistent with value-weighted optimization)
-    caps_dict = get_market_caps_for_date(tickers, rebalance_date=t, px_prices=px_prices)
-
-    caps = np.array([caps_dict.get(ticker, np.nan) for ticker in tickers])
-    valid = ~np.isnan(caps)
-
-    if valid.sum() < 2:
-        raise ValueError("Not enough market caps to build a prior.")
-
-    x0 = np.zeros(len(tickers))
-    x0[valid] = caps[valid] / caps[valid].sum()
+    # Try to get market caps at rebalance date
+    # On cloud environments, Yahoo Finance may be rate-limited, so we use fallbacks
+    try:
+        caps_dict = get_market_caps_for_date(tickers, rebalance_date=t, px_prices=px_prices)
+        caps = np.array([caps_dict.get(ticker, np.nan) for ticker in tickers])
+        valid = ~np.isnan(caps)
+        
+        if valid.sum() >= 2:
+            # Use market-cap weights
+            x0 = np.zeros(len(tickers))
+            x0[valid] = caps[valid] / caps[valid].sum()
+        else:
+            # Fallback: inverse volatility weights (risk parity inspired)
+            inv_vols = 1.0 / (vols + 1e-8)
+            x0 = inv_vols / inv_vols.sum()
+    except Exception:
+        # Fallback: inverse volatility weights
+        inv_vols = 1.0 / (vols + 1e-8)
+        x0 = inv_vols / inv_vols.sum()
 
     # Implied returns (prior)
     pi_raw = gamma * (Sigma_mens @ x0).reshape(-1, 1)
