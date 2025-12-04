@@ -120,6 +120,76 @@ SP500_TICKERS_2019 = [
 # =============================================================================
 # DATA LOADING FUNCTIONS
 # =============================================================================
+# =======================================
+# MARKET CAP CACHING (FAST)
+# =======================================
+
+# =======================================
+# MARKET CAP CACHING (FAST)
+# =======================================
+
+MARKET_CAP_CACHE_FILE = Path("data/processed/market_caps.parquet")
+
+def load_market_cap_cache():
+    """Load cached market caps if available."""
+    if MARKET_CAP_CACHE_FILE.exists():
+        try:
+            return pd.read_parquet(MARKET_CAP_CACHE_FILE).set_index("ticker")["market_cap"].to_dict()
+        except:
+            return {}
+    return {}
+
+def save_market_cap_cache(cache_dict):
+    """Save new market caps to disk."""
+    df = pd.DataFrame([
+        {"ticker": tic, "market_cap": mc} for tic, mc in cache_dict.items()
+    ])
+    df.to_parquet(MARKET_CAP_CACHE_FILE, index=False)
+
+def robust_market_caps_cached(tickers, px_last):
+    """
+    Returns market caps quickly using:
+    - local cache when possible
+    - Yahoo only for missing tickers
+    - Automatic update of the cache
+    """
+    cache = load_market_cap_cache()
+    new_data = {}
+
+    # What needs to be downloaded?
+    missing = [t for t in tickers if t not in cache]
+
+    # Yahoo calls only for missing tickers
+    if missing:
+        for t in missing:
+            try:
+                yf_t = yf.Ticker(t)
+
+                # market_cap
+                mc = yf_t.fast_info.get("market_cap", None)
+
+                # fallback
+                if mc is None or not np.isfinite(mc):
+                    shares = yf_t.fast_info.get("shares_outstanding", None)
+                    if shares is None:
+                        shares = yf_t.info.get("sharesOutstanding", None)
+
+                    if shares is not None:
+                        price = px_last.get(t, None)
+                        if price is not None:
+                            mc = shares * price
+
+                if mc is not None and np.isfinite(mc):
+                    new_data[t] = float(mc)
+
+            except:
+                continue
+
+        # Update local cache on disk
+        cache.update(new_data)
+        save_market_cap_cache(cache)
+
+    return cache
 
 def load_stocktwits_info():
     """Load and display StockTwits dataset information."""
@@ -457,7 +527,7 @@ def black_litterman_weights_for_date(
     lookback_days=180,
     top_n=50,
     max_long=0.25,
-    max_short=0.10,
+    max_short_per_asset=0.10,
     leverage_limit=1.2, # Default value, but should be passed from front-end
     z_threshold=0.5,
     fixed_universe=None,
@@ -509,8 +579,20 @@ def black_litterman_weights_for_date(
     # Market portfolio (inverse volatility)
     gamma = float(lam)
     vols = np.sqrt(np.diag(Sigma_mens))
-    x0 = 1.0 / vols
-    x0 /= x0.sum()
+
+    px_last = px_prices.loc[t, universe].to_dict()
+
+    # Load from cache (fast) + update missing tickers (slow)
+    caps_dict = robust_market_caps_cached(tickers, px_last)
+
+    caps = np.array([caps_dict.get(t, np.nan) for t in tickers])
+    valid = ~np.isnan(caps)
+
+    if valid.sum() < 2:
+        raise ValueError("Not enough market caps to build a prior.")
+
+    x0 = np.zeros(len(tickers))
+    x0[valid] = caps[valid] / caps[valid].sum()
 
     # Implied returns (prior)
     pi_raw = gamma * (Sigma_mens @ x0).reshape(-1, 1)
@@ -558,7 +640,7 @@ def black_litterman_weights_for_date(
         cp.sum(w) == 1.0,
         cp.norm1(w) <= float(leverage_limit),  # Dynamic gross exposure
         w <= float(max_long),
-        w >= -float(max_short),
+        w >= -float(max_short_per_asset),
     ]
 
     prob = cp.Problem(objective, constraints)

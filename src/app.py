@@ -482,6 +482,9 @@ def navbar():
 # ==========================================
 # 3. DATA LOADING & CACHING
 # ==========================================
+@st.cache_data
+def cached_market_caps(tickers):
+    return get_market_caps(tickers)
 
 @st.cache_data
 def load_bl_data():
@@ -586,6 +589,7 @@ def cached_training_universe(_px_prices, _rets_all, _sentiment_df, train_start_s
     return available_tickers
 
 
+
 # ==========================================
 # 4. CORE MATH & UTILITY FUNCTIONS
 # ==========================================
@@ -639,7 +643,83 @@ def compute_metrics(cum_curve):
         "Sortino Ratio": float(sortino),
         "Calmar Ratio": float(calmar),
     }
+def plot_dynamic_allocation(weights_df):
+    """
+    Affiche l'évolution de la composition du portefeuille dans le temps.
+    Type: Stacked Area Chart.
+    """
+    fig = go.Figure()
+    
+    # Palette de couleurs "Luxury" (Or, Gris, Blanc cassé, Bronze)
+    # On cycle dessus si plus d'actifs
+    colors = [
+        '#c5a059', '#e0e0e0', '#8c7034', '#555555', 
+        '#d4af37', '#999999', '#5e4b25', '#333333'
+    ]
+    
+    # On empile les actifs
+    for i, col in enumerate(weights_df.columns):
+        color = colors[i % len(colors)]
+        fig.add_trace(go.Scatter(
+            x=weights_df.index,
+            y=weights_df[col],
+            mode='lines',
+            stackgroup='one', # C'est ça qui crée l'empilement
+            name=col,
+            line=dict(width=0.5, color=color),
+            fillcolor=color
+        ))
 
+    fig.update_layout(
+        title='Portfolio Composition Evolution',
+        yaxis=dict(
+            title='Weight', 
+            tickformat='.0%', 
+            range=[0, 1], # Force l'axe Y de 0 à 100%
+            gridcolor='#333'
+        ),
+        xaxis=dict(gridcolor='#333'),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#e0e0e0'),
+        height=450,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    return fig
+def plot_correlation_heatmap(returns_df):
+    """
+    Affiche la matrice de corrélation des actifs.
+    Permet de voir instantanément si le portefeuille est bien diversifié.
+    """
+    # Calcul de la corrélation (-1 à +1)
+    corr = returns_df.corr()
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=corr.values,
+        x=corr.columns,
+        y=corr.columns,
+        colorscale='RdBu_r', # Rouge = Forte corrélation, Bleu = Décorrélation (inverse)
+        zmin=-1, 
+        zmax=1,
+        text=np.round(corr.values, 2),
+        texttemplate="%{text}",
+        textfont={"size": 12, "color": "white"},
+        hoverongaps=False
+    ))
+
+    fig.update_layout(
+        title='Asset Correlation Matrix',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#e0e0e0'),
+        height=500,
+        xaxis=dict(side="bottom"),
+        yaxis=dict(autorange="reversed") # Pour avoir l'ordre identique en X et Y
+    )
+    
+    return fig
 
 # --- Optimizer Utilities ---
 def get_market_caps(tickers, rebalance_date, data_source):
@@ -813,7 +893,7 @@ def extract_sentiment_data(t, sentiment_df, rets_all, train_universe, z_threshol
 
 
 def compute_oos_rebalanced_notebook_style(rebal_dates, px_prices, sentiment_df, lam, rets_all, alpha_dyn, z_threshold,
-                                          train_universe, max_long, leverage_limit):
+                                          train_universe, max_long,max_short_per_asset, leverage_limit):
     """Wrapper function for OOS simulation with dynamic constraints."""
     price_index = px_prices.index
     last_w = None
@@ -823,7 +903,7 @@ def compute_oos_rebalanced_notebook_style(rebal_dates, px_prices, sentiment_df, 
         w_t, K_detected, strong_views = black_litterman_weights_for_date(
             t=t, sentiment_df=sentiment_df, lam=lam, px_prices=px_prices,
             rets_all=rets_all, window_sent=30, lookback_days=180, top_n=50,
-            max_long=max_long, max_short=GLOBAL_BL_CONSTANTS['MAX_SHORT'], leverage_limit=leverage_limit,
+            max_long=max_long, max_short_per_asset=max_short_per_asset, leverage_limit=leverage_limit,
             alpha_dyn=alpha_dyn, z_threshold=z_threshold, fixed_universe=train_universe,
         )
         if (w_t is None) or (len(w_t) == 0):
@@ -1136,6 +1216,16 @@ def blacklitterman_page():
             0.05, 0.50, GLOBAL_BL_CONSTANTS['MAX_LONG'], 0.05,
             help=long_help
         )
+        short_help = (
+            "Maximum short position allowed PER asset.\n\n"
+            "• Example: 0.05 = a stock cannot be shorted more than -5%.\n"
+            "• Long and short max constraints are symmetrical but independent.\n"
+        )
+        max_short_per_asset = st.slider(
+            "Max Short Position Size",
+            0.01, 0.50, 0.10, 0.01,
+            help=short_help
+        )
 
         lev_help = (
             "The limit on Gross Exposure (Longs + Absolute Shorts).\n\n"
@@ -1186,12 +1276,13 @@ def blacklitterman_page():
                 t=date_selected_dt,
                 sentiment_df=sentiment_df, lam=lam, px_prices=px_prices, rets_all=rets_all,
                 alpha_dyn=alpha_dyn, z_threshold=z_threshold, window_sent=30, lookback_days=180,
-                top_n=50, max_long=max_long, max_short=GLOBAL_BL_CONSTANTS['MAX_SHORT'], leverage_limit=leverage,
+                top_n=50, max_long=max_long, max_short_per_asset=max_short_per_asset, leverage_limit=leverage,
                 fixed_universe=train_universe,
             )
+            w_df = w_df.replace([np.inf, -np.inf, np.nan], 0)
+
             if w_df is None:
-                st.error("⚠️ Impossible de générer un portefeuille Black-Litterman avec ces paramètres. "
-                "Veuillez ajuster le Z-Score, les messages minimums ou les contraintes.")
+                st.error("Unable to generate a Black-Litterman portfolio with these parameters. Please adjust the Z-Score, minimum messages, or constraints.")
                 return
             if w_df is not None:
                 # 1. Sentiment Views
@@ -1201,6 +1292,8 @@ def blacklitterman_page():
                     t=date_selected_dt, sentiment_df=sentiment_df, rets_all=rets_all,
                     train_universe=train_universe, z_threshold=z_threshold, alpha_val=alpha_dyn
                 )
+                sentiment_views_df = sentiment_views_df.replace([np.inf, -np.inf, np.nan], 0)
+
 
                 if not sentiment_views_df.empty:
                     active_views = sentiment_views_df[sentiment_views_df['Relevance'] == 'Active View']
@@ -1240,13 +1333,30 @@ def blacklitterman_page():
                 else:
                     st.info("No active sentiment views.")
 
+
+                    st.dataframe(
+                    w_sorted[["ticker", "w_opt", "Direction"]]
+                        .rename(columns={"ticker": "Ticker", "w_opt": "Weight"})
+                        .assign(Weight=lambda df: df["Weight"].map("{:.2%}".format)),
+                    use_container_width=True, height=350
+)
+
+
                 st.markdown("---")
 
                 # 2. Allocation
                 st.markdown('<div class="section-sub">Optimal Portfolio Allocation</div>', unsafe_allow_html=True)
 
                 col1, col2 = st.columns([2, 1])
+                w_df["w_opt"] = (
+                    pd.to_numeric(w_df["w_opt"], errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)             
+                    .fillna(0.0)                                    
+                    .astype(float)                                   
+                )
                 top = w_df.sort_values("w_opt", ascending=False).head(15)
+                top = top.replace([np.inf, -np.inf, np.nan], 0)
+
 
                 with col1:
                     # Use a cleaner, darker theme for Plotly
@@ -1267,7 +1377,87 @@ def blacklitterman_page():
                     
 
                 with col2:
-                    st.dataframe(top.set_index("ticker").style.format("{:.2%}"), use_container_width=True, height=400)
+                        df_top = (
+                            top[["ticker", "w_opt"]]
+                            .rename(columns={"ticker": "Ticker", "w_opt": "Weight"})
+                            .set_index("Ticker")
+                        )
+
+                        styled_top = df_top.style.format({"Weight": "{:.2%}"})
+
+                        st.table(styled_top)
+
+                st.markdown("### Comparison: BL Weights vs Market-Cap Weights")
+
+                # Compute market-cap weights
+                tickers_compare = w_df["ticker"].tolist()
+                mkt_caps = get_market_caps(tickers_compare, date_selected_dt, px_prices)
+
+                if len(mkt_caps) > 0:
+                    w_mkt_df = pd.DataFrame({
+                        "ticker": list(mkt_caps.keys()),
+                        "w_mkt": [cap / sum(mkt_caps.values()) for cap in mkt_caps.values()]
+                    })
+                else:
+                    st.warning(" Market-cap unavailable — fallback to Equal Weight.")
+                    w_mkt_df = pd.DataFrame({
+                        "ticker": tickers_compare,
+                        "w_mkt": np.ones(len(tickers_compare)) / len(tickers_compare)
+                    })
+
+                # Merge BL + Market-Cap
+                compare = w_df.merge(w_mkt_df, on="ticker")
+                compare = compare.sort_values("w_opt", ascending=False).head(20)
+
+                # === Graph BL vs Market-Cap ===
+                fig_cmp = go.Figure()
+                fig_cmp.add_trace(go.Bar(
+                    x=compare["ticker"],
+                    y=compare["w_opt"],
+                    name="Black-Litterman",
+                    marker_color="#c5a059"
+                ))
+                fig_cmp.add_trace(go.Bar(
+                    x=compare["ticker"],
+                    y=compare["w_mkt"],
+                    name="Market-Cap Weight",
+                    marker_color="#777"
+                ))
+
+                fig_cmp.update_layout(
+                    barmode="group",
+                    yaxis_tickformat=".2%",
+                    height=450,
+                    title="BL Allocation vs Market Equilibrium",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#e0e0e0")
+                )
+
+                st.plotly_chart(fig_cmp, use_container_width=True)
+
+                st.markdown("### Active Weights (BL - Market-Cap)")
+
+                compare["active"] = compare["w_opt"] - compare["w_mkt"]
+
+                fig_active = go.Figure(go.Bar(
+                    x=compare["ticker"],
+                    y=compare["active"],
+                    marker_color=compare["active"].apply(lambda x: "#4ade80" if x > 0 else "#f87171")
+                ))
+
+                fig_active.update_layout(
+                    title="Active Weights: Over/Under-Weight vs Market Benchmark",
+                    yaxis_tickformat=".2%",
+                    height=400,
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#e0e0e0")
+                )
+
+                st.plotly_chart(fig_active, use_container_width=True)
+
+
 
                 # 3. Backtest
                 st.markdown("---")
@@ -1282,7 +1472,8 @@ def blacklitterman_page():
                         nav_oos_custom = compute_oos_rebalanced_notebook_style(
                             rebal_dates=rebal_dates, px_prices=px_prices, sentiment_df=sentiment_df,
                             lam=lam, rets_all=rets_all, alpha_dyn=alpha_dyn, z_threshold=z_threshold,
-                            train_universe=train_universe, max_long=max_long, leverage_limit=leverage
+                            train_universe=train_universe, max_long=max_long, max_short_per_asset=max_short_per_asset,
+                            leverage_limit=leverage
                         )
 
                     if nav_oos_custom is not None and len(nav_oos_custom) > 0:
@@ -1341,6 +1532,7 @@ def blacklitterman_page():
                     .applymap(lambda v: "color:#f87171" if v < 0 else "color:#4ade80", subset=["Weight"])
                 )
                 st.dataframe(styled_ls, use_container_width=True, height=350)
+
                 st.markdown("---")
                 st.markdown("### Portfolio Performance Metrics")
                 if nav_oos_custom is not None:
@@ -1434,7 +1626,7 @@ def optimizer_page():
     method = st.sidebar.radio("Strategy", ["Max Sharpe Ratio", "Min Variance", "Value-Weighted"])
     rebalance = st.sidebar.selectbox("Rebalance", ["Yearly", "Quarterly", "Monthly"])
 
-    if st.sidebar.button("🚀 Optimize", type="primary"):
+    if st.sidebar.button("Optimize", type="primary"):
         with st.spinner("Fetching Data..."):
             data = yf.download(stocks, start=start, end=end, auto_adjust=False)['Adj Close']
 
@@ -1493,7 +1685,24 @@ def optimizer_page():
         final_w = pd.DataFrame({'Stock': stocks, 'Weight': weights_hist.iloc[-1]}).sort_values('Weight',
                                                                                                ascending=False)
         st.dataframe(final_w.style.format({'Weight': '{:.1%}'}))
-
+        
+        st.markdown("### Asset Allocation History")
+        
+        # Génération du graph d'allocation
+        fig_alloc = plot_dynamic_allocation(weights_hist)
+        st.plotly_chart(fig_alloc, use_container_width=True)
+        
+        st.caption("Visualizes how the optimizer rebalanced the portfolio over time based on changing market conditions.")
+        st.markdown("---")
+        st.markdown("### Diversification Analysis")
+        
+        # Génération de la Heatmap
+        # On utilise 'returns' qui contient les rendements de tous les actifs sélectionnés
+        fig_corr = plot_correlation_heatmap(returns)
+        st.plotly_chart(fig_corr, use_container_width=True)
+        
+        st.caption("Correlation measures how assets move in relation to each other. Values close to 1.0 (Red) mean assets move together (High Risk). Values close to 0 or negative (Blue) imply diversification benefits.")
+        
     st.markdown('</div>', unsafe_allow_html=True)
 
 
