@@ -722,74 +722,155 @@ def plot_correlation_heatmap(returns_df):
     return fig
 
 # --- Optimizer Utilities ---
-def get_market_caps(tickers, rebalance_date, data_source):
-    def get_quarter_for_date(stmt, rebalance_date):
-        available_quarters = [pd.to_datetime(q) for q in stmt.columns]
-        available_quarters = sorted(available_quarters, reverse=True)
-        for q in available_quarters:
-            if q <= rebalance_date: return q.strftime('%Y-%m-%d')
-        return stmt.columns[0]
 
+def get_market_caps(tickers, rebalance_date=None, data_source=None):
+    """
+    Fetch market capitalizations for given tickers at a specific date.
+    Market cap = shares outstanding × price at rebalance_date
+    """
     market_caps = {}
+    
+    if rebalance_date is not None:
+        rebalance_date = pd.to_datetime(rebalance_date)
+    
     for ticker in tickers:
         try:
             stock = yf.Ticker(ticker)
             info = stock.info
-            if ticker in data_source.columns and rebalance_date in data_source.index:
-                price = data_source.loc[rebalance_date, ticker]
-            else:
-                price = info.get('regularMarketPrice', None)
-
-            market_cap = info.get('marketCap', None)
-            # Attempt to get share count
-            try:
-                stmt = stock.quarterly_income_stmt
-                if not stmt.empty:
-                    quarter_date = get_quarter_for_date(stmt, rebalance_date)
-                    shares_out = stmt.loc['Basic Average Shares', quarter_date]
-                    if not pd.isna(shares_out) and price is not None and not pd.isna(price):
-                        market_cap = shares_out * price
-            except:
-                pass
-
-            if market_cap is None:
-                shares_out = info.get('sharesOutstanding', None)
-                if shares_out is not None and price is not None and not pd.isna(price):
-                    market_cap = shares_out * price
-
-            if market_cap: market_caps[ticker] = market_cap
-        except:
-            pass
+            
+            # Get shares outstanding
+            shares_out = info.get('sharesOutstanding', None)
+            if shares_out is None:
+                continue
+            
+            # Get price at rebalance_date
+            price = None
+            
+            # Try data_source first
+            if data_source is not None and rebalance_date is not None and ticker in data_source.columns:
+                available_dates = data_source.index[data_source.index <= rebalance_date]
+                if len(available_dates) > 0:
+                    closest_date = available_dates[-1]
+                    price = data_source.loc[closest_date, ticker]
+                    if pd.isna(price):
+                        price = None
+            
+            # Fallback: fetch historical price from Yahoo Finance
+            if price is None and rebalance_date is not None:
+                start = rebalance_date - pd.Timedelta(days=7)
+                end = rebalance_date + pd.Timedelta(days=1)
+                hist = stock.history(start=start, end=end)
+                if not hist.empty:
+                    # Get closest date on or before rebalance_date
+                    hist.index = hist.index.tz_localize(None)
+                    valid_dates = hist.index[hist.index <= rebalance_date]
+                    if len(valid_dates) > 0:
+                        price = hist.loc[valid_dates[-1], 'Close']
+            
+            # Final fallback: current price
+            if price is None:
+                price = info.get('regularMarketPrice') or info.get('previousClose')
+            
+            # Compute market cap
+            if price is not None and not pd.isna(price):
+                market_cap = float(shares_out) * float(price)
+                if market_cap > 0:
+                    market_caps[ticker] = market_cap
+                    
+        except Exception:
+            continue
+    
     return market_caps
 
 
 def optimize_portfolio_at_date(data_window, rf_rate, optimization_method, stocks):
-    returns_window = data_window.pct_change().dropna()
-    mean_returns_window = returns_window.mean()
-    cov_matrix_window = returns_window.cov()
-
+    """
+    Optimize portfolio weights at a specific date using the specified method.
+    
+    Args:
+        data_window: DataFrame of price data
+        rf_rate: Risk-free rate (can be None for Value-Weighted)
+        optimization_method: One of "Max Sharpe Ratio", "Min Variance", "Value-Weighted"
+        stocks: List of stock tickers
+    
+    Returns:
+        numpy array of portfolio weights
+    """
     num_assets = len(stocks)
-    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-    bounds = tuple((0, 1) for _ in range(num_assets))
-    initial_guess = num_assets * [1. / num_assets]
-
-    if optimization_method == "Max Sharpe Ratio":
-        result = minimize(neg_sharpe_ratio, initial_guess, args=(mean_returns_window, cov_matrix_window, rf_rate),
-                          method='SLSQP', bounds=bounds, constraints=constraints)
-        return result.x
-    elif optimization_method == "Min Variance":
-        result = minimize(portfolio_variance, initial_guess, args=(mean_returns_window, cov_matrix_window),
-                          method='SLSQP', bounds=bounds, constraints=constraints)
-        return result.x
-    elif optimization_method == "Value-Weighted":
+    equal_weights = np.array([1.0 / num_assets] * num_assets)
+    
+    if data_window.empty or len(data_window) < 2:
+        return equal_weights
+    
+    if optimization_method == "Value-Weighted":
         rebalance_date = data_window.index[-1]
         market_caps = get_market_caps(stocks, rebalance_date, data_window)
-        if market_caps:
+        
+        if market_caps and len(market_caps) > 0:
+            # Calculate weights based on market cap
             total_market_cap = sum(market_caps.values())
-            weights = np.array([market_caps.get(stock, 0) / total_market_cap for stock in stocks])
-            return weights / weights.sum()
-        else:
-            return np.array([1 / num_assets] * num_assets)
+            if total_market_cap > 0:
+                weights = np.array([market_caps.get(stock, 0) / total_market_cap for stock in stocks])
+                weight_sum = weights.sum()
+                if weight_sum > 0:
+                    return weights / weight_sum
+        
+        # Fallback to equal weights if market caps unavailable
+        return equal_weights
+    
+    # For optimization methods, we need returns
+    returns_window = data_window.pct_change().dropna()
+    
+    if len(returns_window) < 10:  # Need minimum observations for meaningful optimization
+        return equal_weights
+    
+    mean_returns_window = returns_window.mean()
+    cov_matrix_window = returns_window.cov()
+    
+    # Check for valid covariance matrix
+    if cov_matrix_window.isnull().any().any():
+        return equal_weights
+    
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+    bounds = tuple((0, 1) for _ in range(num_assets))
+    initial_guess = [1.0 / num_assets] * num_assets
+
+    try:
+        if optimization_method == "Max Sharpe Ratio":
+            rf = rf_rate if rf_rate is not None else 0.02  # Default 2% if not provided
+            result = minimize(
+                neg_sharpe_ratio, 
+                initial_guess, 
+                args=(mean_returns_window, cov_matrix_window, rf),
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints=constraints,
+                options={'maxiter': 1000}
+            )
+            if result.success:
+                return result.x
+            else:
+                return equal_weights
+                
+        elif optimization_method == "Min Variance":
+            result = minimize(
+                portfolio_variance, 
+                initial_guess, 
+                args=(mean_returns_window, cov_matrix_window),
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints=constraints,
+                options={'maxiter': 1000}
+            )
+            if result.success:
+                return result.x
+            else:
+                return equal_weights
+                
+    except Exception:
+        return equal_weights
+    
+    return equal_weights
 
 
 def generate_rebalance_dates(start_date, end_date, frequency, trading_index, month=None, day=31):
@@ -1630,7 +1711,13 @@ def optimizer_page():
         with st.spinner("Fetching Data..."):
             data = yf.download(stocks, start=start, end=end, auto_adjust=False)['Adj Close']
 
-        if data.empty: st.error("No data."); return
+        if data.empty:
+            st.error("No data.")
+            return
+        
+        # Handle single stock case (returns Series instead of DataFrame)
+        if isinstance(data, pd.Series):
+            data = data.to_frame(name=stocks[0])
 
         # Run Optimization (Simplified view for brevity, full logic in functions above)
         returns = data.pct_change().dropna()
@@ -1641,20 +1728,38 @@ def optimizer_page():
 
         # Run Rolling Optimization
         rebal_dates = generate_rebalance_dates(start, end, rebalance, data.index)
-        weights_hist = pd.DataFrame(index=data.index, columns=stocks).fillna(0.0)
+        weights_hist = pd.DataFrame(index=data.index, columns=stocks, dtype=float).fillna(0.0)
 
         current_w = None
+        rf_rate = 0.02  # Default risk-free rate (2%)
+        
         for i, date in enumerate(data.index):
-            if pd.Timestamp(date) in rebal_dates or current_w is None:
+            # Check if we need to rebalance
+            needs_rebalance = (current_w is None) or (pd.Timestamp(date) in rebal_dates)
+            
+            if needs_rebalance:
                 if method == "Value-Weighted":
-                    current_w = optimize_portfolio_at_date(data.iloc[:i + 1], None, method, stocks)
-                else:
-                    # Simple MVO window
-                    win = data.iloc[max(0, i - 252):i]
-                    if len(win) > 50:
-                        current_w = optimize_portfolio_at_date(win, 0.02, method, stocks)
+                    # For value-weighted, use all available data up to current date
+                    data_window = data.iloc[:i + 1]
+                    if len(data_window) > 0:
+                        current_w = optimize_portfolio_at_date(data_window, None, method, stocks)
                     else:
-                        current_w = np.array([1 / len(stocks)] * len(stocks))
+                        current_w = np.array([1.0 / len(stocks)] * len(stocks))
+                else:
+                    # For MVO methods, use rolling window
+                    lookback = 252  # 1 year lookback
+                    window_start = max(0, i - lookback)
+                    data_window = data.iloc[window_start:i + 1]
+                    
+                    if len(data_window) > 50:  # Minimum observations
+                        current_w = optimize_portfolio_at_date(data_window, rf_rate, method, stocks)
+                    else:
+                        current_w = np.array([1.0 / len(stocks)] * len(stocks))
+            
+            # Ensure weights are valid
+            if current_w is None:
+                current_w = np.array([1.0 / len(stocks)] * len(stocks))
+            
             weights_hist.iloc[i] = current_w
 
         # Perf
